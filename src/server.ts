@@ -115,6 +115,9 @@ export function backscrollBlock(
   return [`<backscroll ${attrs.join(' ')}>`, ...messages.map(backscrollLine), '</backscroll>'].join('\n');
 }
 
+/** A Slack message ts, as a thread's parent is named (RFC-011 threadId). */
+const SLACK_TS = /^\d+\.\d+$/;
+
 export class SlackMcplServer {
   private conn: McplConnection | null = null;
   private mcplEnabled = false;
@@ -877,7 +880,9 @@ export class SlackMcplServer {
     throw new Error('No matching channel found');
   }
 
-  private async handlePublish(params: ChannelsPublishParams): Promise<ChannelsPublishResult> {
+  private async handlePublish(
+    params: ChannelsPublishParams & { threadId?: unknown },
+  ): Promise<ChannelsPublishResult & { threadId?: string | null; reason?: string }> {
     const parsed = parseMcplChannelId(params.channelId);
     if (!parsed) {
       throw new Error(`Invalid channel ID: ${params.channelId}`);
@@ -894,19 +899,80 @@ export class SlackMcplServer {
       return { delivered: false, messageId: undefined };
     }
 
-    // Reply in the thread of the most recent incoming message on this
-    // conversation; top-level when it wasn't threaded.
-    const threadTs = this.lastIncomingThreadTs.get(parsed.conversationId);
-    const result = await this.slack.sendMessage(
-      parsed.conversationId,
-      text,
-      threadTs ? { threadTs } : {},
-    );
-    this.stateTracker.recordSent(result.messageId, parsed.conversationId, text);
-    this.markOutbound(parsed.conversationId);
-    dbg('handlePublish:sent', { channelId: params.channelId, messageId: result.messageId, threadTs });
+    const conversationId = parsed.conversationId;
+    if (params.threadId === undefined) {
+      // A legacy caller (no RFC-011 target): reply in the thread of the most
+      // recent incoming message on this conversation; top-level when it
+      // wasn't threaded. Kept exactly for callers that name no place.
+      const threadTs = this.lastIncomingThreadTs.get(conversationId);
+      const result = await this.slack.sendMessage(conversationId, text, threadTs ? { threadTs } : {});
+      this.stateTracker.recordSent(result.messageId, conversationId, text);
+      this.markOutbound(conversationId);
+      dbg('handlePublish:sent', { channelId: params.channelId, messageId: result.messageId, threadTs });
+      return { delivered: true, messageId: result.messageId };
+    }
 
-    return { delivered: true, messageId: result.messageId };
+    // RFC-011: the caller named the place — a thread's parent ts, or null
+    // for top level — and every conversation declares publish.target
+    // 'exact'. It lands exactly there or fails with nothing posted
+    // (delivered: false, no message id); it is never moved to the top level
+    // or to another thread, and the latest-incoming heuristic plays no part.
+    const target = params.threadId;
+    const refuse = (reason: string) => {
+      dbg('handlePublish:refused-target', { channelId: params.channelId, threadId: target, reason });
+      return { delivered: false, reason };
+    };
+    if (target !== null && !(typeof target === 'string' && SLACK_TS.test(target))) {
+      return refuse(`invalid threadId ${JSON.stringify(target)}: expected a thread's parent ts, or null for the top level`);
+    }
+    // A write this server would refuse before reaching Slack
+    // (SLACK_SEND_CHANNELS, SLACK_DISABLE_DMS) is a certain no-post: say so.
+    const blocked = await this.slack.writeRefusal(conversationId);
+    if (blocked) return refuse(`${blocked}; nothing was posted`);
+    // Every thread target is confirmed with Slack just before posting —
+    // including one seen arriving, since its parent may since have been
+    // deleted — so a bad target never reaches chat.postMessage, whatever
+    // Slack would do with it there. (A deletion in the moment between this
+    // check and the post is the one case left to the platform.)
+    if (typeof target === 'string') {
+      let status: 'parent' | 'reply' | 'missing';
+      try {
+        status = await this.slack.threadParent(conversationId, target);
+      } catch (err) {
+        return refuse(`could not confirm thread ${target} in this conversation (${(err as Error).message}); nothing was posted`);
+      }
+      if (status !== 'parent') {
+        return refuse(status === 'reply'
+          ? `${target} is a reply inside a thread, not a thread's parent; nothing was posted`
+          : `no message ${target} in this conversation to reply under; nothing was posted`);
+      }
+    }
+
+    let result: { messageId: string; landedThreadTs?: string | null };
+    try {
+      result = await this.slack.sendMessage(conversationId, text, typeof target === 'string' ? { threadTs: target } : {});
+    } catch (err) {
+      // Slack's own refusal (an ok:false answer) posted nothing — say so as a
+      // definite failure. internal_error/fatal_error may have partly
+      // succeeded, and anything else (a lost connection) can't tell: those
+      // stay errors, which the host treats as unconfirmed.
+      const e = err as { code?: string; data?: { error?: string } };
+      const slackError = e.code === 'slack_webapi_platform_error' ? e.data?.error : undefined;
+      if (slackError && slackError !== 'internal_error' && slackError !== 'fatal_error') {
+        return refuse(`Slack refused the post: ${slackError}`);
+      }
+      throw err;
+    }
+    this.stateTracker.recordSent(result.messageId, conversationId, text);
+    this.markOutbound(conversationId);
+    dbg('handlePublish:sent', { channelId: params.channelId, messageId: result.messageId, threadId: target, landed: result.landedThreadTs });
+    // The echo is where Slack's response says the post landed. Without one
+    // there is nothing to echo, and the host counts it as unconfirmed.
+    return {
+      delivered: true,
+      messageId: result.messageId,
+      ...(result.landedThreadTs !== undefined ? { threadId: result.landedThreadTs } : {}),
+    };
   }
 
   // ── Rollback ──

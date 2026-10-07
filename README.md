@@ -33,6 +33,12 @@ that grant arrives; plain MCP tool calls are unaffected.
 - **Attachments**: incoming files are forwarded as refs and fetched on demand
   via `fetch_attachment`, which is auth-locked to `files.slack.com` (the bot
   token is never sent to any other host) and size-capped at 5MB.
+- **Targeted publish** (MCPL RFC-011): every conversation declares
+  `capabilities.publish.target: 'exact'`. A host that sends `threadId` on
+  `channels/publish` gets exactly that place, a thread's parent ts or
+  `null` for the top level, or a refusal with nothing posted; the result
+  echoes where Slack says the post landed. Without `threadId`, publish
+  follows the newest incoming message's thread as before (#6).
 - **Rollback**: `slack.messaging` supports MCPL checkpoints — rolling back
   deletes the messages the bot sent after the checkpoint (best-effort).
 

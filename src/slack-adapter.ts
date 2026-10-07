@@ -180,7 +180,7 @@ export interface SlackWebLike {
     replies(args: Record<string, unknown>): Promise<{ messages?: unknown[]; response_metadata?: { next_cursor?: string } }>;
   };
   chat: {
-    postMessage(args: Record<string, unknown>): Promise<{ ts?: string }>;
+    postMessage(args: Record<string, unknown>): Promise<{ ts?: string; message?: { ts?: string; thread_ts?: string } }>;
     update(args: Record<string, unknown>): Promise<unknown>;
     delete(args: Record<string, unknown>): Promise<unknown>;
   };
@@ -404,7 +404,7 @@ export class SlackAdapter {
     channelId: string,
     text: string,
     opts: { threadTs?: string } = {},
-  ): Promise<{ messageId: string }> {
+  ): Promise<{ messageId: string; landedThreadTs?: string | null }> {
     this.assertWritable(channelId);
     await this.assertNotDm(channelId);
     const result = await this.web.chat.postMessage({
@@ -413,7 +413,14 @@ export class SlackAdapter {
       ...(opts.threadTs ? { thread_ts: opts.threadTs } : {}),
     });
     void this.clearAck(channelId);
-    return { messageId: result.ts ? String(result.ts) : '' };
+    // landedThreadTs: where Slack's own response says the post landed — the
+    // thread's parent ts, null for top level, or absent when the response
+    // carried no message to tell (then nobody can say; callers must not guess).
+    const posted = result.message;
+    return {
+      messageId: result.ts ? String(result.ts) : '',
+      ...(posted ? { landedThreadTs: posted.thread_ts ? String(posted.thread_ts) : null } : {}),
+    };
   }
 
   /** With SLACK_DISABLE_DMS, only a conversation Slack confirmed to be a
@@ -511,6 +518,45 @@ export class SlackAdapter {
     } while (cursor);
     // conversations.replies returns oldest-first already.
     return { messages: await this.shapeHistory(collected), truncated };
+  }
+
+  /** Why a write to `channelId` would be refused before reaching Slack
+   *  (SLACK_SEND_CHANNELS, SLACK_DISABLE_DMS), or undefined when it would go
+   *  through. Asks nothing of Slack beyond what those checks already ask. */
+  async writeRefusal(channelId: string): Promise<string | undefined> {
+    try {
+      this.assertWritable(channelId);
+      await this.assertNotDm(channelId);
+      return undefined;
+    } catch (err) {
+      return (err as Error).message;
+    }
+  }
+
+  /**
+   * Whether `ts` is a message in `channelId` that can take thread replies:
+   * a top-level message, with or without replies yet (`parent`). A reply
+   * inside some thread is `reply`; a ts Slack cannot find in this
+   * conversation is `missing`. Any other failure throws: the caller cannot
+   * tell, and must not post on a guess.
+   */
+  async threadParent(channelId: string, ts: string): Promise<'parent' | 'reply' | 'missing'> {
+    await this.assertNotDm(channelId);
+    let first: { ts?: unknown; thread_ts?: unknown } | undefined;
+    try {
+      const result = await this.web.conversations.replies({ channel: channelId, ts, limit: 1 });
+      first = (result.messages ?? [])[0] as typeof first;
+    } catch (err) {
+      const code = (err as { data?: { error?: string } }).data?.error;
+      if (code === 'thread_not_found' || code === 'message_not_found') return 'missing';
+      throw err;
+    }
+    if (!first || String(first.ts) !== ts) {
+      // Slack answered with a different message first: ts sits inside the
+      // thread of that parent, if anywhere.
+      return first?.thread_ts !== undefined && String(first.thread_ts) === String(first.ts) ? 'reply' : 'missing';
+    }
+    return first.thread_ts !== undefined && String(first.thread_ts) !== ts ? 'reply' : 'parent';
   }
 
   private async shapeHistory(messages: SlackHistoryMessage[]): Promise<HistoryMessage[]> {
