@@ -1228,6 +1228,11 @@ export class SlackMcplServer {
           // The MCPL channel ID, so a host can route and type to a channel it
           // has not opened (zulip-mcp sends the same field).
           mcplChannelId: channelMcplId,
+          // MCPL RFC-011: a message in a thread names it as origin.threadId,
+          // in the id space channels/publish takes (the thread's parent ts),
+          // so a host answering a push can name the same place it would for
+          // channels/incoming. threadTs stays for existing readers.
+          ...(msg.threadTs ? { threadId: msg.threadTs } : {}),
           threadTs: msg.threadTs,
           authorId: msg.authorId,
           authorName: msg.authorName,

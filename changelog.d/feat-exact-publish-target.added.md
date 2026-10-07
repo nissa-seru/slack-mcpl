@@ -11,4 +11,7 @@
   invalid value; a conversation `SLACK_SEND_CHANNELS` or
   `SLACK_DISABLE_DMS` blocks; or Slack's own refusal, such as a
   thread-only channel. A request without `threadId` keeps the
-  latest-incoming-thread placement and result shape exactly.
+  latest-incoming-thread placement and result shape exactly. A push about a message in a thread (a conversation the host
+  hasn't opened) names that thread as `origin.threadId`, in the id space
+  `channels/publish` takes, so a host answering it can name the same place;
+  `origin.threadTs` stays for existing readers.
