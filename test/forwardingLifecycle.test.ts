@@ -17,22 +17,29 @@ const historyMessage: HistoryMessage = {
   timestamp: new Date(100000), attachments: [],
 };
 
-function fixture(history = async (_channel: string) => [historyMessage]) {
+function fixture(
+  history = async (_channel: string) => [historyMessage],
+  beforeMeta = async () => {},
+) {
   const handlers: Array<(msg: SlackMessageData) => void> = [];
   const posts: Array<{ channel: string; threadTs?: string }> = [];
   const histories: string[] = [];
+  const cleared: string[] = [];
   const slack = {
     teamName: 'acme', botUserId: 'UBOT', dmsWritable: true,
     canWrite: () => true,
     onMessage(handler: (msg: SlackMessageData) => void) { handlers.push(handler); },
     async listConversations() { return [{ id: 'C1', name: 'general', kind: 'channel', isMember: true }]; },
-    async getConversationMeta(id: string) { return { id, name: 'general', kind: 'channel', isMember: true }; },
+    async getConversationMeta(id: string) {
+      await beforeMeta();
+      return { id, name: 'general', kind: 'channel', isMember: true };
+    },
     async fetchHistory(channel: string) {
       histories.push(channel);
       return { messages: await history(channel), truncated: false };
     },
     async acknowledge() {},
-    async clearAck() {},
+    async clearAck(channel: string, ts?: string) { cleared.push(`${channel}/${ts}`); },
     async sendMessage(channel: string, _text: string, opts: { threadTs?: string } = {}) {
       posts.push({ channel, ...opts });
       return { messageId: '200.0' };
@@ -40,7 +47,7 @@ function fixture(history = async (_channel: string) => [historyMessage]) {
   } as unknown as SlackAdapter;
   const server = new SlackMcplServer(slack);
   return {
-    server, handlers, histories, posts,
+    server, handlers, histories, posts, cleared,
     emit(id: string, channelId = 'C1', overrides: Partial<SlackMessageData> = {}) {
       const msg: SlackMessageData = {
         channelId, id, authorId: 'U2', authorName: 'Ann', content: 'hello', cleanContent: 'hello',
@@ -263,5 +270,50 @@ test('a new peer does not publish into the previous peer\x27s last thread', asyn
     assert.deepEqual(f.posts, [{ channel: 'C1' }]);
   } finally {
     await next.close();
+  }
+});
+
+test('a message whose peer leaves during a metadata lookup changes nothing for the next peer', async () => {
+  // Lookup 1 is the first-interaction one, before the mention auto-subscribes.
+  // Lookup 2 is the location header's, before the conversation's thread and
+  // watermark are recorded. Each has its own check.
+  for (const gated of [1, 2]) {
+    const gate = deferred<void>();
+    let lookups = 0;
+    const f = fixture(undefined, async () => { if (++lookups === gated) await gate.promise; });
+    const first = connect(f.server);
+    await first.ready();
+    f.emit('111.1', 'C1', { threadTs: '110.0' });
+    await until(() => lookups === gated, `lookup ${gated} under way`);
+    await first.close();
+
+    const next = connect(f.server);
+    try {
+      await next.ready();
+      if (gated === 1) {
+        gate.resolve();
+        await until(() => f.cleared.length > 0, 'the abandoned mention releases its reaction');
+        // The abandoned mention did not subscribe the conversation: an ambient
+        // message is dropped, and the mention after it is the one delivery.
+        f.emit('112.1', 'C1', { mentionsBot: false, mentionIds: [] });
+        f.emit('112.2', 'C1');
+        await until(() => next.deliveries().length > 0, 'the mention');
+        await settle();
+        assert.equal(next.deliveries().length, 1, `lookup ${gated}`);
+        assert.match(pushText(next.deliveries()[0]), /id=112.2/);
+      } else {
+        f.emit('112.1', 'C1', { threadTs: '112.0' });
+        await until(() => next.deliveries().length > 0, 'the new peer\'s mention');
+        gate.resolve();
+        await until(() => f.cleared.length > 0, 'the abandoned mention releases its reaction');
+        await next.publish();
+        assert.deepEqual(f.posts, [{ channel: 'C1', threadTs: '112.0' }], `lookup ${gated}`);
+      }
+      assert.deepEqual(f.cleared, ['C1/111.1'], `lookup ${gated}`);
+      assert.equal(first.deliveries().length, 0, `lookup ${gated}`);
+    } finally {
+      gate.resolve();
+      await next.close();
+    }
   }
 });
