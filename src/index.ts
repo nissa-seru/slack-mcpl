@@ -32,8 +32,18 @@ import * as net from 'node:net';
 import { McplConnection } from '@animalabs/mcpl-core';
 import { connectSlack } from './slack-adapter.js';
 import { SlackMcplServer } from './server.js';
-
 import { booleanFlag } from './config.js';
+
+/** A yes/no switch from the environment. A bad value stops the server with
+ *  one line naming it: it is the operator's to fix, not a crash to trace. */
+function flag(name: string): boolean {
+  try {
+    return booleanFlag(name, process.env[name]);
+  } catch (err) {
+    console.error((err as Error).message);
+    process.exit(1);
+  }
+}
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
@@ -63,8 +73,8 @@ async function main(): Promise<void> {
     console.error('SLACK_SEND_CHANNELS is set but names no conversation; unset it to allow writing anywhere');
     process.exit(1);
   }
-  const disableDms = booleanFlag('SLACK_DISABLE_DMS', process.env.SLACK_DISABLE_DMS);
-  const subscribeMemberChannels = booleanFlag('SLACK_SUBSCRIBE_MEMBER_CHANNELS', process.env.SLACK_SUBSCRIBE_MEMBER_CHANNELS);
+  const disableDms = flag('SLACK_DISABLE_DMS');
+  const subscribeMemberChannels = flag('SLACK_SUBSCRIBE_MEMBER_CHANNELS');
   const ackReaction = process.env.SLACK_ACK_REACTION?.replace(/:/g, '').trim() || undefined;
   const slack = await connectSlack({ botToken, appToken, dmUsers, sendChannels, disableDms, ackReaction });
   const server = new SlackMcplServer(slack, {
