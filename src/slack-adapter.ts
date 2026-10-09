@@ -403,14 +403,13 @@ export class SlackAdapter {
   private async removeAck(channelId: string, ts: string, entry: AckEntry): Promise<void> {
     clearTimeout(entry.timer);
     if (!(await entry.added)) return this.dropAck(channelId, ts, entry);
-    if (this.ackPending.get(channelId)?.get(ts) !== entry) return;
-    if (entry.tries >= ACK_MAX_TRIES) return this.dropAck(channelId, ts, entry);
     entry.tries++;
     try {
       await this.web.reactions.remove({ channel: channelId, timestamp: ts, name: this.ackReaction! });
       this.dropAck(channelId, ts, entry);
     } catch (err) {
-      // Slack's own answer (data.error) will be the same next time.
+      // Slack's own answer (data.error) will be the same next time. The fifth
+      // failure drops the entry, so no sixth attempt can start.
       const answered = !!(err as { data?: { error?: string } } | null)?.data?.error;
       if (answered || this.stopping || entry.tries >= ACK_MAX_TRIES) this.dropAck(channelId, ts, entry);
       else entry.timer = this.armAck(channelId, ts, ACK_RETRY_MS);
